@@ -11,6 +11,12 @@ from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 from pydantic import BaseModel, Field
+from tenacity import (
+    retry,
+    retry_if_exception_message,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from bugbug.tools.base import GenerativeModelTool
 from bugbug.tools.build_repair.config import (
@@ -20,11 +26,14 @@ from bugbug.tools.build_repair.config import (
     FIREFOX_MCP_URL,
     FIX_MODEL,
     SANDBOX_CONFIG,
+    VERIFY_ALLOWED_TOOLS,
+    VERIFY_MODEL,
 )
 from bugbug.tools.build_repair.prompts import (
     ANALYSIS_TEMPLATE,
     EVAL_PROMPT,
     FIX_TEMPLATE,
+    VERIFY_TEMPLATE,
 )
 
 logger = getLogger(__name__)
@@ -44,7 +53,16 @@ class BuildFailure(BaseModel):
     )
 
 
-class AgentResponse(BaseModel):
+class UsageStats(BaseModel):
+    cost_usd: float = Field(default=0.0)
+    num_turns: int = Field(default=0)
+    input_tokens: int = Field(default=0)
+    output_tokens: int = Field(default=0)
+    cache_read_input_tokens: int = Field(default=0)
+    cache_creation_input_tokens: int = Field(default=0)
+
+
+class AgentResponse(UsageStats):
     """Output from a build repair run, including analysis, diff, cost, and build results."""
 
     summary: str = Field(default="")
@@ -53,18 +71,34 @@ class AgentResponse(BaseModel):
     error: str | None = Field(default=None)
     error_traceback: str | None = Field(default=None)
     failure_stage: str | None = Field(default=None)
-    cost_usd: float = Field(default=0.0)
-    num_turns: int = Field(default=0)
-    input_tokens: int = Field(default=0)
-    output_tokens: int = Field(default=0)
-    cache_read_input_tokens: int = Field(default=0)
-    cache_creation_input_tokens: int = Field(default=0)
     local_build_passed: bool | None = Field(default=None)
     try_build_passed: bool | None = Field(default=None)
     lando_job_id: str | None = Field(default=None)
     treeherder_url: str | None = Field(default=None)
     stage1_transcript: list[dict] = Field(default_factory=list)
     stage2_transcript: list[dict] = Field(default_factory=list)
+
+
+class GroundTruth(BaseModel):
+    gh_fix_commits: list[str] = Field(
+        description="Git commit hashes of the ground truth fix."
+    )
+
+
+class Judgment(BaseModel):
+    analysis_correct: bool
+    analysis_quality: float
+    analysis_explanation: str
+    fix_matches_ground_truth: bool
+    fix_quality: float
+    fix_explanation: str
+    fix_acceptance_probability: float
+    fix_acceptance_explanation: str
+
+
+class VerifyResponse(UsageStats):
+    judgment: Judgment | None = Field(default=None)
+    verification_transcript: list[dict] = Field(default_factory=list)
 
 
 class BuildRepairTool(GenerativeModelTool):
@@ -82,12 +116,14 @@ class BuildRepairTool(GenerativeModelTool):
         eval_mode: bool = False,
         analysis_model: str = ANALYSIS_MODEL,
         fix_model: str = FIX_MODEL,
+        verify_model: str = VERIFY_MODEL,
     ) -> None:
         self.eval_mode = eval_mode
         self.target_software = target_software
         self.analysis_only = analysis_only
         self.analysis_model = analysis_model
         self.fix_model = fix_model
+        self.verify_model = verify_model
 
     @classmethod
     def create(cls, **kwargs):
@@ -128,16 +164,18 @@ class BuildRepairTool(GenerativeModelTool):
         result_data: dict = {}
         usage: dict = {}
 
-        if on_message:
-            on_message(
-                stage_name,
-                {
-                    "type": "stage_start",
-                    "prompt": prompt,
-                    "model": model,
-                },
-            )
-        try:
+        @retry(
+            retry=retry_if_exception_message(match="Control request timeout"),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=2, min=2, max=30),
+            before_sleep=lambda rs: logger.warning(
+                f"Bug {bug_id}: {stage_name} init timeout "
+                f"(attempt {rs.attempt_number}/3), retrying..."
+            ),
+            reraise=True,
+        )
+        async def _query():
+            nonlocal cost, turns, usage, result_data
             async for message in query(prompt=prompt, options=options):
                 serialized = self._serialize_message(message)
                 transcript.append(serialized)
@@ -150,6 +188,18 @@ class BuildRepairTool(GenerativeModelTool):
                     turns += message.num_turns or 0
                     usage = getattr(message, "usage", {}) or {}
                     result_data = serialized
+
+        if on_message:
+            on_message(
+                stage_name,
+                {
+                    "type": "stage_start",
+                    "prompt": prompt,
+                    "model": model,
+                },
+            )
+        try:
+            await _query()
         finally:
             if on_message:
                 on_message(
@@ -233,6 +283,7 @@ class BuildRepairTool(GenerativeModelTool):
         analysis_prompt = ANALYSIS_TEMPLATE.format(
             bug_id=failure.bug_id,
             target_software=self.target_software,
+            worktree_path=worktree_path,
             eval=EVAL_PROMPT if self.eval_mode else "",
         )
         try:
@@ -305,7 +356,10 @@ class BuildRepairTool(GenerativeModelTool):
             mcp_servers=mcp_servers,
         )
         fix_prompt = FIX_TEMPLATE.format(
-            bug_id=failure.bug_id, eval=EVAL_PROMPT if self.eval_mode else ""
+            target_software=self.target_software,
+            bug_id=failure.bug_id,
+            worktree_path=worktree_path,
+            eval=EVAL_PROMPT if self.eval_mode else "",
         )
         try:
             (
@@ -409,4 +463,78 @@ class BuildRepairTool(GenerativeModelTool):
             treeherder_url=try_result.treeherder_url,
             stage1_transcript=stage1_transcript,
             stage2_transcript=stage2_transcript,
+        )
+
+    async def verify(
+        self,
+        failure: BuildFailure,
+        agent_diff: str,
+        ground_truth: GroundTruth,
+        worktree_path: Path,
+        on_message: Callable[[str, dict], None] | None = None,
+    ) -> VerifyResponse:
+        out_dir = worktree_path / "repair_agent" / "out" / str(failure.bug_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "agent_fix.diff").write_text(agent_diff)
+
+        gt_commits = " ".join(ground_truth.gh_fix_commits)
+        prompt = VERIFY_TEMPLATE.format(
+            target_software=self.target_software,
+            bug_id=failure.bug_id,
+            failure_commit=failure.git_commit,
+            ground_truth_commits=gt_commits,
+            worktree_path=worktree_path,
+        )
+
+        options = ClaudeAgentOptions(
+            model=self.verify_model,
+            cwd=str(worktree_path),
+            allowed_tools=VERIFY_ALLOWED_TOOLS,
+            disallowed_tools=["AskUserQuestion", "Task"],
+            sandbox=SANDBOX_CONFIG,
+            permission_mode="acceptEdits",
+            effort="high",
+            output_format={
+                "type": "json_schema",
+                "schema": Judgment.model_json_schema(),
+            },
+        )
+
+        logger.info(
+            f"Bug {failure.bug_id}: starting verification stage "
+            f"(model={self.verify_model}, ground_truth={gt_commits})"
+        )
+
+        judgment: Judgment | None = None
+        transcript: list[dict] = []
+        try:
+            transcript, cost, turns, usage = await self._run_stage(
+                "verification",
+                prompt,
+                self.verify_model,
+                options,
+                failure.bug_id,
+                on_message,
+            )
+            for msg in reversed(transcript):
+                if msg.get("structured_output"):
+                    judgment = Judgment.model_validate(msg["structured_output"])
+                    break
+        except Exception as e:
+            logger.error(
+                f"Bug {failure.bug_id}: verification stage failed: {e}", exc_info=True
+            )
+            return VerifyResponse(verification_transcript=transcript)
+
+        if judgment is None:
+            logger.error(
+                f"Bug {failure.bug_id}: verification judge did not produce structured output"
+            )
+
+        return VerifyResponse(
+            judgment=judgment,
+            cost_usd=cost,
+            num_turns=turns,
+            verification_transcript=transcript,
+            **self._usage_fields(usage),
         )
