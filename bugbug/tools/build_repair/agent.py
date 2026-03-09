@@ -13,9 +13,10 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 from pydantic import BaseModel, Field
 from tenacity import (
     retry,
+    retry_if_exception,
     retry_if_exception_message,
     stop_after_attempt,
-    wait_exponential,
+    wait_exponential_jitter,
 )
 
 from bugbug.tools.base import GenerativeModelTool
@@ -165,12 +166,20 @@ class BuildRepairTool(GenerativeModelTool):
         usage: dict = {}
 
         @retry(
-            retry=retry_if_exception_message(match="Control request timeout"),
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=2, min=2, max=30),
+            retry=(
+                retry_if_exception_message(match="Control request timeout")
+                | retry_if_exception_message(match="overloaded")
+                | retry_if_exception_message(match="529")
+                | retry_if_exception_message(match="exit code")
+                | retry_if_exception(
+                    lambda e: isinstance(e, (TimeoutError, ConnectionError, OSError))
+                )
+            ),
+            stop=stop_after_attempt(5),
+            wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
             before_sleep=lambda rs: logger.warning(
-                f"Bug {bug_id}: {stage_name} init timeout "
-                f"(attempt {rs.attempt_number}/3), retrying..."
+                f"Bug {bug_id}: {stage_name} transient error "
+                f"(attempt {rs.attempt_number}/5), retrying: {rs.outcome.exception()}"
             ),
             reraise=True,
         )
@@ -179,8 +188,7 @@ class BuildRepairTool(GenerativeModelTool):
             async for message in query(prompt=prompt, options=options):
                 serialized = self._serialize_message(message)
                 transcript.append(serialized)
-                logger.info(f"Bug {bug_id}: {stage_name} [{serialized['type']}]")
-                logger.debug(f"Bug {bug_id}: {stage_name} detail: {serialized}")
+                logger.debug(f"Bug {bug_id}: {stage_name} [{serialized['type']}]")
                 if on_message:
                     on_message(stage_name, serialized)
                 if isinstance(message, ResultMessage):
