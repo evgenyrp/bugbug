@@ -473,6 +473,15 @@ class BuildRepairTool(GenerativeModelTool):
             stage2_transcript=stage2_transcript,
         )
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(initial=2, max=30, jitter=5),
+        before_sleep=lambda rs: logger.warning(
+            f"Verification failed (attempt {rs.attempt_number}/3), "
+            f"retrying: {rs.outcome.exception()}"
+        ),
+        reraise=True,
+    )
     async def verify(
         self,
         failure: BuildFailure,
@@ -513,30 +522,26 @@ class BuildRepairTool(GenerativeModelTool):
             f"(model={self.verify_model}, ground_truth={gt_commits})"
         )
 
+        transcript, cost, turns, usage = await self._run_stage(
+            "verification",
+            prompt,
+            self.verify_model,
+            options,
+            failure.bug_id,
+            on_message,
+        )
+
         judgment: Judgment | None = None
-        transcript: list[dict] = []
-        try:
-            transcript, cost, turns, usage = await self._run_stage(
-                "verification",
-                prompt,
-                self.verify_model,
-                options,
-                failure.bug_id,
-                on_message,
-            )
-            for msg in reversed(transcript):
-                if msg.get("structured_output"):
-                    judgment = Judgment.model_validate(msg["structured_output"])
-                    break
-        except Exception as e:
-            logger.error(
-                f"Bug {failure.bug_id}: verification stage failed: {e}", exc_info=True
-            )
-            return VerifyResponse(verification_transcript=transcript)
+        for msg in reversed(transcript):
+            if msg.get("structured_output"):
+                judgment = Judgment.model_validate(msg["structured_output"])
+                break
 
         if judgment is None:
-            logger.error(
-                f"Bug {failure.bug_id}: verification judge did not produce structured output"
+            result_msgs = [m for m in transcript if m.get("type") == "ResultMessage"]
+            raise RuntimeError(
+                f"Bug {failure.bug_id}: verification produced no structured output. "
+                f"Result messages: {result_msgs}"
             )
 
         return VerifyResponse(
