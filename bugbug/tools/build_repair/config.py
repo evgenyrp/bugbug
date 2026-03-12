@@ -9,7 +9,7 @@ from claude_agent_sdk import SandboxNetworkConfig, SandboxSettings
 
 ANALYSIS_MODEL = "claude-opus-4-6"
 FIX_MODEL = "claude-opus-4-6"
-VERIFY_MODEL = "claude-sonnet-4-6"
+VERIFY_MODEL = "claude-opus-4-6"
 DEFAULT_MAX_TURNS = 80
 WORKTREE_BASE_DIR = "/tmp/build_repair_worktrees"
 TRY_PUSH_TIMEOUT_SECONDS = 7200
