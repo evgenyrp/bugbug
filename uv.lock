@@ -2599,6 +2599,7 @@ dependencies = [
     { name = "sendgrid" },
     { name = "sentry-sdk" },
     { name = "taskcluster" },
+    { name = "zstandard" },
 ]
 
 [package.optional-dependencies]
@@ -2618,6 +2619,7 @@ requires-dist = [
     { name = "sendgrid", specifier = ">=6.12.5" },
     { name = "sentry-sdk", specifier = ">=2.51.0" },
     { name = "taskcluster", specifier = ">=97.1,<100.4" },
+    { name = "zstandard", specifier = "~=0.25.0" },
 ]
 provides-extras = ["dev"]
 
