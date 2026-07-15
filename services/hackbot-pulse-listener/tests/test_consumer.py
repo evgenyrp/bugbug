@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from app import consumer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -9,6 +10,14 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 def setup_function():
     consumer._seen.clear()
+
+
+@pytest.fixture(autouse=True)
+def _stub_pushlog():
+    # Keep the pushlog expansion off the network by default; tests that care
+    # about its output re-patch it locally.
+    with patch.object(consumer.pushlog, "get_push_commits", return_value=[]):
+        yield
 
 
 def _sample_bodies():
@@ -66,8 +75,8 @@ def test_build_failure_triggers_run_and_submits_poll():
     assert run_id == "run-1"
     trigger.assert_called_once()
     inputs = trigger.call_args.args[0]
-    assert inputs["git_commit"] == "deadbeef"
     assert inputs["failure_tasks"] == {"build-linux64/opt": "ABC"}
+    assert "git_commits" not in inputs
     executor.submit.assert_called_once()
     fn, ctx = executor.submit.call_args.args
     assert fn is consumer.worker.poll_and_notify
@@ -77,6 +86,29 @@ def test_build_failure_triggers_run_and_submits_poll():
     assert ctx.task_id == "ABC"
     assert ctx.repo == "autoland"
     assert ctx.developer_email == "dev@mozilla.com"
+
+
+def test_failure_tasks_sent_and_commit_authors_recorded():
+    executor = MagicMock()
+    commits = [
+        {"git_commit": "deadbeef", "author_email": "b@m.com"},
+        {"git_commit": "aaa", "author_email": "a@m.com"},
+    ]
+    with (
+        patch.object(consumer.taskcluster, "get_hg_revision", return_value="hgrev"),
+        patch.object(consumer.lando, "hg_to_git", return_value="deadbeef"),
+        patch.object(consumer.regression, "is_new_build_failure", return_value=True),
+        patch.object(consumer.pushlog, "get_push_commits", return_value=commits) as gp,
+        patch.object(consumer.client, "trigger_run", return_value="run-1") as trigger,
+    ):
+        consumer.process(_build_msg(), executor)
+
+    gp.assert_called_once_with("autoland", "hgrev")
+    # The agent gets the failing tasks and derives the commits itself.
+    assert trigger.call_args.args[0]["failure_tasks"] == {"build-linux64/opt": "ABC"}
+    # The listener keeps the commit -> author map to notify the blamed author.
+    ctx = executor.submit.call_args.args[1]
+    assert ctx.commit_authors == {"deadbeef": "b@m.com", "aaa": "a@m.com"}
 
 
 def test_same_revision_triggers_once():

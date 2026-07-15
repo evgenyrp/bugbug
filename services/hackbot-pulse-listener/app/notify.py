@@ -26,7 +26,9 @@ def send_email(ctx: RunContext, run_doc: dict) -> None:
         logger.info("Run %s produced no patch; skipping notification", ctx.run_id)
         return
 
-    recipients = _recipients(ctx.developer_email)
+    findings = (run_doc.get("summary") or {}).get("findings") or {}
+    blamed_author = _author_for(findings.get("blamed_commit"), ctx.commit_authors)
+    recipients = _recipients(blamed_author, ctx.developer_email)
     if not recipients:
         logger.info("No recipients for run %s; skipping notification", ctx.run_id)
         return
@@ -82,16 +84,20 @@ def send_email(ctx: RunContext, run_doc: dict) -> None:
     )
 
 
-def _recipients(developer_email: str | None) -> list[str]:
-    """Recipients for a run: the revision author plus the team address, deduped.
+def _recipients(
+    author_email: str | None, developer_email: str | None = None
+) -> list[str]:
+    """Recipients for a run, deduped and ordered by priority.
 
+    The blamed commit's author is the primary To (the person who introduced the
+    failure), then the pushing developer, then the team address.
     ``notification_override_email`` short-circuits to a single address so local
     testing never mails real developers or the team.
     """
     if settings.notification_override_email:
         return [settings.notification_override_email]
     recipients: list[str] = []
-    for addr in (developer_email, settings.notification_team_email):
+    for addr in (author_email, developer_email, settings.notification_team_email):
         if addr and addr not in recipients:
             recipients.append(addr)
     return recipients
@@ -121,6 +127,25 @@ def _task_url(task_id: str) -> str:
     return f"{settings.taskcluster_root_url.rstrip('/')}/tasks/{task_id}"
 
 
+def _treeherder_url(repo: str, hg_revision: str, task_id: str) -> str:
+    return (
+        f"{settings.treeherder_url.rstrip('/')}/#/jobs"
+        f"?repo={repo}&revision={hg_revision}&selectedTaskRun={task_id}"
+    )
+
+
+def _author_for(
+    blamed_commit: str | None, commit_authors: dict[str, str]
+) -> str | None:
+    """Look up the author email for the blamed commit hash (prefix-tolerant)."""
+    if not blamed_commit:
+        return None
+    for commit, email in commit_authors.items():
+        if commit.startswith(blamed_commit) or blamed_commit.startswith(commit):
+            return email
+    return None
+
+
 def _bug_url(bug_id: object) -> str:
     return f"{settings.bugzilla_url.rstrip('/')}/show_bug.cgi?id={bug_id}"
 
@@ -136,7 +161,18 @@ def _build_body(ctx: RunContext, run_doc: dict, patch: str | None = None) -> str
         f"- **Revision (git):** [`{ctx.git_commit[:12]}`]({_git_url(ctx.git_commit)})",
         f"- **Revision (hg):** [`{ctx.hg_revision[:12]}`]({_hg_url(ctx.hg_revision)})",
         f"- **Failed task:** [`{ctx.task_id}`]({_task_url(ctx.task_id)})",
+        f"- **Treeherder:** "
+        f"[jobs]({_treeherder_url(ctx.repo, ctx.hg_revision, ctx.task_id)})",
     ]
+
+    blamed_commit = findings.get("blamed_commit")
+    if blamed_commit:
+        author = _author_for(blamed_commit, ctx.commit_authors)
+        by = f" by {author}" if author else ""
+        lines.append(
+            f"- **Likely culprit:** "
+            f"[`{blamed_commit[:12]}`]({_git_url(blamed_commit)}){by}"
+        )
 
     bug_id = findings.get("bug_id") or (run_doc.get("inputs") or {}).get("bug_id")
     if bug_id:

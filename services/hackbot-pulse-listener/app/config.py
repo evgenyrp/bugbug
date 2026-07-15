@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     firefox_git_url: str = "https://github.com/mozilla-firefox/firefox"
     firefox_hg_url: str = "https://hg.mozilla.org/mozilla-unified"
     bugzilla_url: str = "https://bugzilla.mozilla.org"
+    treeherder_url: str = "https://treeherder.mozilla.org"
+    # Base url for per-repo pushlogs (json-pushes), used to expand a failing
+    # revision into all commits of its push.
+    hg_base_url: str = "https://hg.mozilla.org"
 
     # Failure filtering and agent inputs.
     # ``watched_repos`` is a comma-separated list of Taskcluster ``project`` tags.

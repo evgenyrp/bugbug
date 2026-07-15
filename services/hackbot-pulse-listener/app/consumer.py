@@ -6,7 +6,7 @@ from cachetools import TTLCache
 from kombu import Connection, Exchange, Queue
 from kombu.mixins import ConsumerMixin
 
-from app import client, lando, regression, taskcluster, worker
+from app import client, lando, pushlog, regression, taskcluster, worker
 from app.config import settings
 from app.models import RunContext
 
@@ -81,8 +81,16 @@ def process(body: dict, executor: Executor) -> str | None:
             _seen.pop(hg_revision, None)
         return None
 
+    # The agent re-derives the push commits from the failing task itself; the
+    # listener only needs the commit -> author map to attribute the blame.
+    push_commits = pushlog.get_push_commits(project, hg_revision)
+    commit_authors = {
+        c["git_commit"]: c["author_email"]
+        for c in push_commits
+        if c.get("author_email")
+    }
+
     inputs: dict = {
-        "git_commit": git_commit,
         "failure_tasks": {task_name: task_id},
         "run_try_push": settings.run_try_push,
     }
@@ -114,6 +122,7 @@ def process(body: dict, executor: Executor) -> str | None:
             hg_revision=hg_revision,
             task_id=task_id,
             developer_email=developer_email,
+            commit_authors=commit_authors,
         )
         executor.submit(worker.poll_and_notify, ctx)
     return run_id
